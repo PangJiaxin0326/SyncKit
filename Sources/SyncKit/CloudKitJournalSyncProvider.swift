@@ -71,7 +71,7 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
             throw SyncError.unavailableAccount(status)
         }
 
-        let records = try await fetchChangedRecords()
+        let records = try await fetchManifestRecords()
         let entryRecords = records.filter { $0.recordType == RecordType.entry }
         let blockRecords = records.filter { $0.recordType == RecordType.block }
         let mediaRecords = records.filter { $0.recordType == RecordType.media }
@@ -99,31 +99,50 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
         }
     }
 
-    private func fetchChangedRecords() async throws -> [CKRecord] {
-        let zoneID = CKRecordZone.default().zoneID
-        var records: [CKRecord] = []
-        var changeToken: CKServerChangeToken?
-        var moreComing = false
+    private func fetchManifestRecords() async throws -> [CKRecord] {
+        guard let manifest = try await fetchManifestRecord() else {
+            return []
+        }
 
-        repeat {
-            let result = try await database.recordZoneChanges(
-                inZoneWith: zoneID,
-                since: changeToken,
-                desiredKeys: nil,
-                resultsLimit: nil
-            )
-            for recordResult in result.modificationResultsByID.values {
-                switch recordResult {
-                case .success(let modification):
-                    records.append(modification.record)
+        let recordNames = manifest.stringArrayValue(Field.entryRecordNames)
+            + manifest.stringArrayValue(Field.blockRecordNames)
+            + manifest.stringArrayValue(Field.mediaRecordNames)
+        return try await fetchRecords(named: recordNames)
+    }
+
+    private func fetchManifestRecord() async throws -> CKRecord? {
+        let recordID = CloudKitJournalRecordFactory.manifestRecordID()
+        let results = try await database.records(for: [recordID])
+        guard let result = results[recordID] else {
+            return nil
+        }
+
+        switch result {
+        case .success(let record):
+            return record
+        case .failure(let error) where error.isMissingCloudKitRecord:
+            return nil
+        case .failure(let error):
+            throw error
+        }
+    }
+
+    private func fetchRecords(named recordNames: [String]) async throws -> [CKRecord] {
+        var records: [CKRecord] = []
+        let recordIDs = recordNames.map(CKRecord.ID.init(recordName:))
+        for batch in recordIDs.chunked(into: maxRecordsPerBatch) {
+            let results = try await database.records(for: batch)
+            for result in results.values {
+                switch result {
+                case .success(let record):
+                    records.append(record)
+                case .failure(let error) where error.isMissingCloudKitRecord:
+                    continue
                 case .failure(let error):
                     throw error
                 }
             }
-            changeToken = result.changeToken
-            moreComing = result.moreComing
-        } while moreComing
-
+        }
         return records
     }
 }
@@ -160,6 +179,7 @@ private struct CloudKitJournalDownloadPayload {
 }
 
 private enum RecordType {
+    static let manifest = "JournalManifest"
     static let entry = "JournalEntry"
     static let block = "JournalBlock"
     static let media = "JournalMedia"
@@ -189,21 +209,30 @@ private enum Field {
     static let asset = "asset"
     static let fileName = "fileName"
     static let generatedAt = "generatedAt"
+    static let entryRecordNames = "entryRecordNames"
+    static let blockRecordNames = "blockRecordNames"
+    static let mediaRecordNames = "mediaRecordNames"
 }
 
 private enum CloudKitJournalRecordFactory {
+    private static let manifestRecordName = "journal-manifest-v1"
 
     static func records(from snapshot: JournalSyncSnapshot) -> CloudKitJournalRecordPayload {
         var records: [CKRecord] = []
+        var entryRecordNames: [String] = []
+        var blockRecordNames: [String] = []
+        var mediaRecordNames: [String] = []
         var mediaRecordCount = 0
         var skippedMediaCount = 0
 
         for entry in snapshot.entries {
             let entryID = entryRecordID(entry.id)
+            entryRecordNames.append(entryID.recordName)
             records.append(entryRecord(for: entry, recordID: entryID, generatedAt: snapshot.generatedAt))
 
             for block in entry.blocks {
                 let blockID = blockRecordID(block.id)
+                blockRecordNames.append(blockID.recordName)
                 records.append(blockRecord(for: block, entryID: entryID, entryExternalID: entry.id.uuidString))
 
                 guard let media = block.media else { continue }
@@ -212,12 +241,15 @@ private enum CloudKitJournalRecordFactory {
                     continue
                 }
 
+                let mediaID = mediaRecordID(block.id)
+                mediaRecordNames.append(mediaID.recordName)
                 records.append(
                     mediaRecord(
                         for: media,
                         block: block,
                         entryID: entryID,
                         blockID: blockID,
+                        recordID: mediaID,
                         entryExternalID: entry.id.uuidString
                     )
                 )
@@ -225,11 +257,39 @@ private enum CloudKitJournalRecordFactory {
             }
         }
 
+        records.append(
+            manifestRecord(
+                generatedAt: snapshot.generatedAt,
+                entryRecordNames: entryRecordNames,
+                blockRecordNames: blockRecordNames,
+                mediaRecordNames: mediaRecordNames
+            )
+        )
+
         return CloudKitJournalRecordPayload(
             records: records,
             mediaRecordCount: mediaRecordCount,
             skippedMediaCount: skippedMediaCount
         )
+    }
+
+    static func manifestRecordID() -> CKRecord.ID {
+        CKRecord.ID(recordName: manifestRecordName)
+    }
+
+    private static func manifestRecord(
+        generatedAt: Date,
+        entryRecordNames: [String],
+        blockRecordNames: [String],
+        mediaRecordNames: [String]
+    ) -> CKRecord {
+        let record = CKRecord(recordType: RecordType.manifest, recordID: manifestRecordID())
+        record[Field.schemaVersion] = NSNumber(value: 1)
+        record[Field.generatedAt] = generatedAt as NSDate
+        record[Field.entryRecordNames] = entryRecordNames as NSArray
+        record[Field.blockRecordNames] = blockRecordNames as NSArray
+        record[Field.mediaRecordNames] = mediaRecordNames as NSArray
+        return record
     }
 
     private static func entryRecord(
@@ -278,9 +338,10 @@ private enum CloudKitJournalRecordFactory {
         block: JournalSyncBlock,
         entryID: CKRecord.ID,
         blockID: CKRecord.ID,
+        recordID: CKRecord.ID,
         entryExternalID: String
     ) -> CKRecord {
-        let record = CKRecord(recordType: RecordType.media, recordID: mediaRecordID(block.id))
+        let record = CKRecord(recordType: RecordType.media, recordID: recordID)
         record[Field.schemaVersion] = NSNumber(value: 1)
         record[Field.externalID] = media.relativePath as NSString
         record[Field.entryExternalID] = entryExternalID as NSString
@@ -497,5 +558,36 @@ private extension CKRecord {
         default:
             nil
         }
+    }
+
+    func stringArrayValue(_ field: String) -> [String] {
+        switch self[field] {
+        case let values as [String]:
+            values
+        case let values as [NSString]:
+            values.map { $0 as String }
+        case let values as NSArray:
+            values.compactMap { value in
+                switch value {
+                case let string as String:
+                    string
+                case let string as NSString:
+                    string as String
+                default:
+                    nil
+                }
+            }
+        default:
+            []
+        }
+    }
+}
+
+private extension Error {
+    var isMissingCloudKitRecord: Bool {
+        guard let error = self as? CKError else {
+            return false
+        }
+        return error.code == .unknownItem || error.code == .zoneNotFound
     }
 }

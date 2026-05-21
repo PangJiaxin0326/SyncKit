@@ -17,3 +17,6 @@ assistant memory out of the cloud path.
   blocks.
 
 Records use deterministic IDs derived from local UUIDs so uploads are idempotent.
+Uploads also maintain a fixed `JournalManifest` record that lists the current
+journal record IDs. Downloads fetch that manifest and then fetch records by ID,
+avoiding CloudKit query indexes and default-zone change APIs.
