@@ -46,7 +46,11 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
             throw SyncError.unavailableAccount(status)
         }
 
-        let payload = CloudKitJournalRecordFactory.records(from: snapshot)
+        let existingManifest = try await fetchManifestRecord()
+        let payload = CloudKitJournalRecordFactory.records(
+            from: snapshot,
+            mergingManifest: existingManifest
+        )
         for batch in payload.records.chunked(into: maxRecordsPerBatch) {
             _ = try await database.modifyRecords(
                 saving: batch,
@@ -242,6 +246,30 @@ private struct CloudKitJournalRecordPayload {
     var skippedMediaCount: Int
 }
 
+struct CloudKitManifestRecordNames: Equatable, Sendable {
+    var entryRecordNames: [String]
+    var blockRecordNames: [String]
+    var mediaRecordNames: [String]
+
+    func merging(_ existing: CloudKitManifestRecordNames?) -> CloudKitManifestRecordNames {
+        guard let existing else { return self }
+        return CloudKitManifestRecordNames(
+            entryRecordNames: Self.merged(entryRecordNames, existing.entryRecordNames),
+            blockRecordNames: Self.merged(blockRecordNames, existing.blockRecordNames),
+            mediaRecordNames: Self.merged(mediaRecordNames, existing.mediaRecordNames)
+        )
+    }
+
+    private static func merged(_ current: [String], _ existing: [String]) -> [String] {
+        var seen = Set(current)
+        var merged = current
+        for name in existing where seen.insert(name).inserted {
+            merged.append(name)
+        }
+        return merged
+    }
+}
+
 private struct CloudKitJournalDownloadPayload {
     var snapshot: JournalSyncSnapshot
     var mediaAttachmentCount: Int
@@ -287,7 +315,10 @@ private enum Field {
 private enum CloudKitJournalRecordFactory {
     private static let manifestRecordName = "journal-manifest-v1"
 
-    static func records(from snapshot: JournalSyncSnapshot) -> CloudKitJournalRecordPayload {
+    static func records(
+        from snapshot: JournalSyncSnapshot,
+        mergingManifest existingManifest: CKRecord? = nil
+    ) -> CloudKitJournalRecordPayload {
         var records: [CKRecord] = []
         var entryRecordNames: [String] = []
         var blockRecordNames: [String] = []
@@ -327,12 +358,18 @@ private enum CloudKitJournalRecordFactory {
             }
         }
 
-        records.append(
-            manifestRecord(
-                generatedAt: snapshot.generatedAt,
+        let manifestNames = CloudKitManifestRecordNames(
                 entryRecordNames: entryRecordNames,
                 blockRecordNames: blockRecordNames,
                 mediaRecordNames: mediaRecordNames
+            )
+            .merging(existingManifest.map(manifestRecordNames))
+        records.append(
+            manifestRecord(
+                generatedAt: snapshot.generatedAt,
+                entryRecordNames: manifestNames.entryRecordNames,
+                blockRecordNames: manifestNames.blockRecordNames,
+                mediaRecordNames: manifestNames.mediaRecordNames
             )
         )
 
@@ -351,6 +388,14 @@ private enum CloudKitJournalRecordFactory {
         [entryRecordID(entry.id)]
             + entry.blocks.map { blockRecordID($0.id) }
             + entry.blocks.map { mediaRecordID($0.id) }
+    }
+
+    private static func manifestRecordNames(_ record: CKRecord) -> CloudKitManifestRecordNames {
+        CloudKitManifestRecordNames(
+            entryRecordNames: record.stringArrayValue(Field.entryRecordNames),
+            blockRecordNames: record.stringArrayValue(Field.blockRecordNames),
+            mediaRecordNames: record.stringArrayValue(Field.mediaRecordNames)
+        )
     }
 
     private static func manifestRecord(

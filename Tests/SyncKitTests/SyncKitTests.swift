@@ -79,4 +79,23 @@ struct SyncKitTests {
         #expect(result.blocksDownloaded == 1)
         #expect(result.snapshot.entries.first?.blocks.first?.content == "Downloaded")
     }
+
+    @Test func manifestMergeKeepsCloudOnlyRecordsForLocalRestore() {
+        let current = CloudKitManifestRecordNames(
+            entryRecordNames: ["entry-local", "entry-shared"],
+            blockRecordNames: ["block-local"],
+            mediaRecordNames: []
+        )
+        let existing = CloudKitManifestRecordNames(
+            entryRecordNames: ["entry-shared", "entry-cloud"],
+            blockRecordNames: ["block-cloud", "block-local"],
+            mediaRecordNames: ["media-cloud"]
+        )
+
+        let merged = current.merging(existing)
+
+        #expect(merged.entryRecordNames == ["entry-local", "entry-shared", "entry-cloud"])
+        #expect(merged.blockRecordNames == ["block-local", "block-cloud"])
+        #expect(merged.mediaRecordNames == ["media-cloud"])
+    }
 }
