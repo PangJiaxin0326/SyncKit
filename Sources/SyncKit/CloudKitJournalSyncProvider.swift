@@ -91,6 +91,45 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
         )
     }
 
+    public func deleteEntry(_ entry: JournalSyncEntry) async throws {
+        let status = await accountStatus()
+        guard status.isAvailable else {
+            throw SyncError.unavailableAccount(status)
+        }
+
+        let candidateRecordIDs = CloudKitJournalRecordFactory.recordIDs(forDeleting: entry)
+        let candidateRecordNames = Set(candidateRecordIDs.map(\.recordName))
+        let manifest = try await fetchManifestRecord()
+        let updatedManifest = manifest.map { Self.removing(candidateRecordNames, from: $0) }
+        let existingRecordIDs = try await fetchExistingRecordIDs(candidateRecordIDs)
+
+        var didSaveManifest = false
+        for batch in existingRecordIDs.chunked(into: maxRecordsPerBatch) {
+            let recordsToSave: [CKRecord]
+            if !didSaveManifest, let updatedManifest {
+                recordsToSave = [updatedManifest]
+            } else {
+                recordsToSave = []
+            }
+            _ = try await database.modifyRecords(
+                saving: recordsToSave,
+                deleting: batch,
+                savePolicy: .changedKeys,
+                atomically: false
+            )
+            didSaveManifest = true
+        }
+
+        if !didSaveManifest, let updatedManifest {
+            _ = try await database.modifyRecords(
+                saving: [updatedManifest],
+                deleting: [],
+                savePolicy: .changedKeys,
+                atomically: false
+            )
+        }
+    }
+
     private var database: CKDatabase {
         switch databaseScope {
         case .private: container.privateCloudDatabase
@@ -144,6 +183,37 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
             }
         }
         return records
+    }
+
+    private func fetchExistingRecordIDs(_ recordIDs: [CKRecord.ID]) async throws -> [CKRecord.ID] {
+        var existingRecordIDs: [CKRecord.ID] = []
+        for batch in recordIDs.chunked(into: maxRecordsPerBatch) {
+            let results = try await database.records(for: batch)
+            for (recordID, result) in results {
+                switch result {
+                case .success:
+                    existingRecordIDs.append(recordID)
+                case .failure(let error) where error.isMissingCloudKitRecord:
+                    continue
+                case .failure(let error):
+                    throw error
+                }
+            }
+        }
+        return existingRecordIDs
+    }
+
+    private static func removing(_ recordNames: Set<String>, from manifest: CKRecord) -> CKRecord {
+        manifest[Field.entryRecordNames] = manifest
+            .stringArrayValue(Field.entryRecordNames)
+            .filter { !recordNames.contains($0) } as NSArray
+        manifest[Field.blockRecordNames] = manifest
+            .stringArrayValue(Field.blockRecordNames)
+            .filter { !recordNames.contains($0) } as NSArray
+        manifest[Field.mediaRecordNames] = manifest
+            .stringArrayValue(Field.mediaRecordNames)
+            .filter { !recordNames.contains($0) } as NSArray
+        return manifest
     }
 }
 
@@ -275,6 +345,12 @@ private enum CloudKitJournalRecordFactory {
 
     static func manifestRecordID() -> CKRecord.ID {
         CKRecord.ID(recordName: manifestRecordName)
+    }
+
+    static func recordIDs(forDeleting entry: JournalSyncEntry) -> [CKRecord.ID] {
+        [entryRecordID(entry.id)]
+            + entry.blocks.map { blockRecordID($0.id) }
+            + entry.blocks.map { mediaRecordID($0.id) }
     }
 
     private static func manifestRecord(
