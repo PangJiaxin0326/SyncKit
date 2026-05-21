@@ -8,6 +8,8 @@ public enum CloudKitDatabaseScope: String, Codable, Hashable, Sendable {
 }
 
 public final class CloudKitJournalSyncProvider: JournalSyncProvider {
+    private static let maxManifestConflictRetries = 2
+
     public let id = "cloudkit"
     public let displayName = "iCloud"
 
@@ -51,17 +53,26 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
             from: snapshot,
             mergingManifest: existingManifest
         )
-        for batch in payload.records.chunked(into: maxRecordsPerBatch) {
-            _ = try await database.modifyRecords(
+        for batch in payload.contentRecords.batches(of: maxRecordsPerBatch) {
+            try await modifyRecords(
                 saving: batch,
                 deleting: [],
-                savePolicy: .allKeys,
-                atomically: false
+                savePolicy: .allKeys
+            )
+        }
+        try await saveManifestRecord(
+            payload.manifestRecord,
+            savePolicy: .allKeys
+        ) { _, serverManifest in
+            CloudKitManifestConflictResolver.manifestByUploading(
+                payload.currentManifestNames,
+                generatedAt: snapshot.generatedAt,
+                rebasedOn: serverManifest
             )
         }
 
         return SyncResult(
-            recordsUploaded: payload.records.count,
+            recordsUploaded: payload.recordCount,
             entriesUploaded: snapshot.entries.count,
             blocksUploaded: snapshot.blockCount,
             mediaUploaded: payload.mediaRecordCount,
@@ -75,14 +86,27 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
             throw SyncError.unavailableAccount(status)
         }
 
-        let records = try await fetchManifestRecords()
+        guard let manifestRecords = try await fetchManifestRecords() else {
+            let snapshot = JournalSyncSnapshot(entries: [])
+            return DownloadResult(
+                snapshot: snapshot,
+                recordsDownloaded: 0,
+                entriesDownloaded: 0,
+                blocksDownloaded: 0,
+                mediaDownloaded: 0,
+                mediaSkipped: 0
+            )
+        }
+
+        let records = manifestRecords.records
         let entryRecords = records.filter { $0.recordType == RecordType.entry }
         let blockRecords = records.filter { $0.recordType == RecordType.block }
         let mediaRecords = records.filter { $0.recordType == RecordType.media }
         let payload = CloudKitJournalRecordDecoder.snapshot(
             entryRecords: entryRecords,
             blockRecords: blockRecords,
-            mediaRecords: mediaRecords
+            mediaRecords: mediaRecords,
+            generatedAt: manifestRecords.generatedAt ?? Date()
         )
 
         return DownloadResult(
@@ -107,29 +131,18 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
         let updatedManifest = manifest.map { Self.removing(candidateRecordNames, from: $0) }
         let existingRecordIDs = try await fetchExistingRecordIDs(candidateRecordIDs)
 
-        var didSaveManifest = false
-        for batch in existingRecordIDs.chunked(into: maxRecordsPerBatch) {
-            let recordsToSave: [CKRecord]
-            if !didSaveManifest, let updatedManifest {
-                recordsToSave = [updatedManifest]
-            } else {
-                recordsToSave = []
-            }
-            _ = try await database.modifyRecords(
-                saving: recordsToSave,
+        for batch in existingRecordIDs.batches(of: maxRecordsPerBatch) {
+            try await modifyRecords(
+                saving: [],
                 deleting: batch,
-                savePolicy: .changedKeys,
-                atomically: false
+                savePolicy: .changedKeys
             )
-            didSaveManifest = true
         }
 
-        if !didSaveManifest, let updatedManifest {
-            _ = try await database.modifyRecords(
-                saving: [updatedManifest],
-                deleting: [],
-                savePolicy: .changedKeys,
-                atomically: false
+        if let updatedManifest {
+            try await saveDeletedEntryManifest(
+                updatedManifest,
+                removing: candidateRecordNames
             )
         }
     }
@@ -142,15 +155,70 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
         }
     }
 
-    private func fetchManifestRecords() async throws -> [CKRecord] {
+    private func modifyRecords(
+        saving recordsToSave: [CKRecord],
+        deleting recordIDsToDelete: [CKRecord.ID],
+        savePolicy: CKModifyRecordsOperation.RecordSavePolicy
+    ) async throws {
+        let result = try await database.modifyRecords(
+            saving: recordsToSave,
+            deleting: recordIDsToDelete,
+            savePolicy: savePolicy,
+            atomically: false
+        )
+        try CloudKitRecordModificationValidator.validate(
+            result,
+            saving: recordsToSave.map(\.recordID),
+            deleting: recordIDsToDelete
+        )
+    }
+
+    private func saveManifestRecord(
+        _ manifestRecord: CKRecord,
+        savePolicy: CKModifyRecordsOperation.RecordSavePolicy,
+        rebasing rebase: (CKRecord, CKRecord) -> CKRecord
+    ) async throws {
+        try await CloudKitManifestConflictRetrier.save(
+            manifestRecord,
+            maxRetries: Self.maxManifestConflictRetries
+        ) { manifest in
+            try await modifyRecords(
+                saving: [manifest],
+                deleting: [],
+                savePolicy: savePolicy
+            )
+        } rebasing: { manifest, serverManifest in
+            rebase(manifest, serverManifest)
+        }
+    }
+
+    private func saveDeletedEntryManifest(
+        _ manifestRecord: CKRecord,
+        removing recordNames: Set<String>
+    ) async throws {
+        try await saveManifestRecord(
+            manifestRecord,
+            savePolicy: .changedKeys
+        ) { _, serverManifest in
+            CloudKitManifestConflictResolver.manifestByDeleting(
+                recordNames,
+                rebasedOn: serverManifest
+            )
+        }
+    }
+
+    private func fetchManifestRecords() async throws -> CloudKitFetchedManifestRecords? {
         guard let manifest = try await fetchManifestRecord() else {
-            return []
+            return nil
         }
 
         let recordNames = manifest.stringArrayValue(Field.entryRecordNames)
             + manifest.stringArrayValue(Field.blockRecordNames)
             + manifest.stringArrayValue(Field.mediaRecordNames)
-        return try await fetchRecords(named: recordNames)
+        return CloudKitFetchedManifestRecords(
+            generatedAt: manifest.dateValue(Field.generatedAt),
+            records: try await fetchRecords(named: recordNames)
+        )
     }
 
     private func fetchManifestRecord() async throws -> CKRecord? {
@@ -173,7 +241,7 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
     private func fetchRecords(named recordNames: [String]) async throws -> [CKRecord] {
         var records: [CKRecord] = []
         let recordIDs = recordNames.map(CKRecord.ID.init(recordName:))
-        for batch in recordIDs.chunked(into: maxRecordsPerBatch) {
+        for batch in recordIDs.batches(of: maxRecordsPerBatch) {
             let results = try await database.records(for: batch)
             for result in results.values {
                 switch result {
@@ -191,7 +259,7 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
 
     private func fetchExistingRecordIDs(_ recordIDs: [CKRecord.ID]) async throws -> [CKRecord.ID] {
         var existingRecordIDs: [CKRecord.ID] = []
-        for batch in recordIDs.chunked(into: maxRecordsPerBatch) {
+        for batch in recordIDs.batches(of: maxRecordsPerBatch) {
             let results = try await database.records(for: batch)
             for (recordID, result) in results {
                 switch result {
@@ -208,16 +276,7 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
     }
 
     private static func removing(_ recordNames: Set<String>, from manifest: CKRecord) -> CKRecord {
-        manifest[Field.entryRecordNames] = manifest
-            .stringArrayValue(Field.entryRecordNames)
-            .filter { !recordNames.contains($0) } as NSArray
-        manifest[Field.blockRecordNames] = manifest
-            .stringArrayValue(Field.blockRecordNames)
-            .filter { !recordNames.contains($0) } as NSArray
-        manifest[Field.mediaRecordNames] = manifest
-            .stringArrayValue(Field.mediaRecordNames)
-            .filter { !recordNames.contains($0) } as NSArray
-        return manifest
+        CloudKitManifestConflictResolver.manifestByDeleting(recordNames, rebasedOn: manifest)
     }
 }
 
@@ -240,16 +299,203 @@ private extension CloudAccountStatus {
     }
 }
 
-private struct CloudKitJournalRecordPayload {
+private struct CloudKitFetchedManifestRecords {
+    var generatedAt: Date?
     var records: [CKRecord]
+}
+
+enum CloudKitRecordModificationError: LocalizedError, Equatable, Sendable {
+    case missingSaveResult(String)
+    case missingDeleteResult(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingSaveResult(let recordName):
+            "CloudKit did not return a save result for \(recordName)."
+        case .missingDeleteResult(let recordName):
+            "CloudKit did not return a delete result for \(recordName)."
+        }
+    }
+}
+
+enum CloudKitRecordModificationValidator {
+    static func validate(
+        _ results: (
+            saveResults: [CKRecord.ID: Result<CKRecord, any Error>],
+            deleteResults: [CKRecord.ID: Result<Void, any Error>]
+        ),
+        saving recordIDsToSave: [CKRecord.ID],
+        deleting recordIDsToDelete: [CKRecord.ID]
+    ) throws {
+        for result in results.saveResults.values {
+            if case .failure(let error) = result {
+                throw error
+            }
+        }
+        for result in results.deleteResults.values {
+            if case .failure(let error) = result {
+                throw error
+            }
+        }
+
+        for recordID in recordIDsToSave where results.saveResults[recordID] == nil {
+            throw CloudKitRecordModificationError.missingSaveResult(recordID.recordName)
+        }
+        for recordID in recordIDsToDelete where results.deleteResults[recordID] == nil {
+            throw CloudKitRecordModificationError.missingDeleteResult(recordID.recordName)
+        }
+    }
+}
+
+enum CloudKitRecordConflict {
+    static func serverRecordChangedRecord(
+        from error: any Error,
+        for recordID: CKRecord.ID
+    ) -> CKRecord? {
+        if let serverRecord = directServerRecordChangedRecord(from: error, for: recordID) {
+            return serverRecord
+        }
+        guard let partialError = partialError(from: error, for: recordID) else {
+            return nil
+        }
+        return directServerRecordChangedRecord(from: partialError, for: recordID)
+    }
+
+    private static func directServerRecordChangedRecord(
+        from error: any Error,
+        for recordID: CKRecord.ID
+    ) -> CKRecord? {
+        if let cloudKitError = error as? CKError {
+            guard cloudKitError.code == .serverRecordChanged else {
+                return nil
+            }
+            guard let serverRecord = cloudKitError.serverRecord else {
+                return nil
+            }
+            return serverRecord.recordID == recordID ? serverRecord : nil
+        }
+
+        let nsError = error as NSError
+        guard nsError.domain == CKErrorDomain,
+              CKError.Code(rawValue: nsError.code) == .serverRecordChanged,
+              let serverRecord = nsError.userInfo[CKRecordChangedErrorServerRecordKey] as? CKRecord
+        else {
+            return nil
+        }
+        return serverRecord.recordID == recordID ? serverRecord : nil
+    }
+
+    private static func partialError(
+        from error: any Error,
+        for recordID: CKRecord.ID
+    ) -> (any Error)? {
+        if let cloudKitError = error as? CKError,
+           let partialError = cloudKitError.partialErrorsByItemID?[AnyHashable(recordID)] {
+            return partialError
+        }
+
+        let userInfo = (error as NSError).userInfo
+        if let partialErrors = userInfo[CKPartialErrorsByItemIDKey] as? [AnyHashable: any Error] {
+            return partialErrors[AnyHashable(recordID)]
+        }
+        if let partialErrors = userInfo[CKPartialErrorsByItemIDKey] as? NSDictionary {
+            return partialErrors[recordID] as? any Error
+        }
+        return nil
+    }
+}
+
+enum CloudKitManifestConflictRetrier {
+    static func save(
+        _ initialManifest: CKRecord,
+        maxRetries: Int,
+        using save: (CKRecord) async throws -> Void,
+        rebasing rebase: (CKRecord, CKRecord) -> CKRecord
+    ) async throws {
+        var manifest = initialManifest
+        var remainingRetries = max(0, maxRetries)
+
+        while true {
+            try Task.checkCancellation()
+            do {
+                try await save(manifest)
+                return
+            } catch {
+                guard remainingRetries > 0,
+                      let serverManifest = CloudKitRecordConflict.serverRecordChangedRecord(
+                        from: error,
+                        for: manifest.recordID
+                      )
+                else {
+                    throw error
+                }
+
+                manifest = rebase(manifest, serverManifest)
+                remainingRetries -= 1
+            }
+        }
+    }
+}
+
+enum CloudKitManifestConflictResolver {
+    static func manifestByUploading(
+        _ currentNames: CloudKitManifestRecordNames,
+        generatedAt: Date,
+        rebasedOn serverManifest: CKRecord
+    ) -> CKRecord {
+        currentNames
+            .merging(CloudKitManifestRecordNames(record: serverManifest))
+            .applying(to: serverManifest, generatedAt: generatedAt)
+    }
+
+    static func manifestByDeleting(
+        _ recordNames: Set<String>,
+        rebasedOn serverManifest: CKRecord
+    ) -> CKRecord {
+        CloudKitManifestRecordNames(record: serverManifest)
+            .removing(recordNames)
+            .applying(to: serverManifest)
+    }
+}
+
+struct CloudKitJournalRecordPayload {
+    var contentRecords: [CKRecord]
+    var manifestRecord: CKRecord
+    var currentManifestNames: CloudKitManifestRecordNames
     var mediaRecordCount: Int
     var skippedMediaCount: Int
+
+    var records: [CKRecord] {
+        contentRecords + [manifestRecord]
+    }
+
+    var recordCount: Int {
+        contentRecords.count + 1
+    }
 }
 
 struct CloudKitManifestRecordNames: Equatable, Sendable {
     var entryRecordNames: [String]
     var blockRecordNames: [String]
     var mediaRecordNames: [String]
+
+    init(
+        entryRecordNames: [String],
+        blockRecordNames: [String],
+        mediaRecordNames: [String]
+    ) {
+        self.entryRecordNames = entryRecordNames
+        self.blockRecordNames = blockRecordNames
+        self.mediaRecordNames = mediaRecordNames
+    }
+
+    init(record: CKRecord) {
+        self.init(
+            entryRecordNames: record.stringArrayValue(Field.entryRecordNames),
+            blockRecordNames: record.stringArrayValue(Field.blockRecordNames),
+            mediaRecordNames: record.stringArrayValue(Field.mediaRecordNames)
+        )
+    }
 
     func merging(_ existing: CloudKitManifestRecordNames?) -> CloudKitManifestRecordNames {
         guard let existing else { return self }
@@ -258,6 +504,25 @@ struct CloudKitManifestRecordNames: Equatable, Sendable {
             blockRecordNames: Self.merged(blockRecordNames, existing.blockRecordNames),
             mediaRecordNames: Self.merged(mediaRecordNames, existing.mediaRecordNames)
         )
+    }
+
+    func removing(_ recordNames: Set<String>) -> CloudKitManifestRecordNames {
+        CloudKitManifestRecordNames(
+            entryRecordNames: entryRecordNames.filter { !recordNames.contains($0) },
+            blockRecordNames: blockRecordNames.filter { !recordNames.contains($0) },
+            mediaRecordNames: mediaRecordNames.filter { !recordNames.contains($0) }
+        )
+    }
+
+    func applying(to record: CKRecord, generatedAt: Date? = nil) -> CKRecord {
+        record[Field.schemaVersion] = NSNumber(value: 1)
+        if let generatedAt {
+            record[Field.generatedAt] = generatedAt as NSDate
+        }
+        record[Field.entryRecordNames] = entryRecordNames as NSArray
+        record[Field.blockRecordNames] = blockRecordNames as NSArray
+        record[Field.mediaRecordNames] = mediaRecordNames as NSArray
+        return record
     }
 
     private static func merged(_ current: [String], _ existing: [String]) -> [String] {
@@ -270,7 +535,7 @@ struct CloudKitManifestRecordNames: Equatable, Sendable {
     }
 }
 
-private struct CloudKitJournalDownloadPayload {
+struct CloudKitJournalDownloadPayload {
     var snapshot: JournalSyncSnapshot
     var mediaAttachmentCount: Int
     var skippedMediaCount: Int
@@ -312,14 +577,14 @@ private enum Field {
     static let mediaRecordNames = "mediaRecordNames"
 }
 
-private enum CloudKitJournalRecordFactory {
+enum CloudKitJournalRecordFactory {
     private static let manifestRecordName = "journal-manifest-v1"
 
     static func records(
         from snapshot: JournalSyncSnapshot,
         mergingManifest existingManifest: CKRecord? = nil
     ) -> CloudKitJournalRecordPayload {
-        var records: [CKRecord] = []
+        var contentRecords: [CKRecord] = []
         var entryRecordNames: [String] = []
         var blockRecordNames: [String] = []
         var mediaRecordNames: [String] = []
@@ -329,12 +594,12 @@ private enum CloudKitJournalRecordFactory {
         for entry in snapshot.entries {
             let entryID = entryRecordID(entry.id)
             entryRecordNames.append(entryID.recordName)
-            records.append(entryRecord(for: entry, recordID: entryID, generatedAt: snapshot.generatedAt))
+            contentRecords.append(entryRecord(for: entry, recordID: entryID, generatedAt: snapshot.generatedAt))
 
             for block in entry.blocks {
                 let blockID = blockRecordID(block.id)
                 blockRecordNames.append(blockID.recordName)
-                records.append(blockRecord(for: block, entryID: entryID, entryExternalID: entry.id.uuidString))
+                contentRecords.append(blockRecord(for: block, entryID: entryID, entryExternalID: entry.id.uuidString))
 
                 guard let media = block.media else { continue }
                 guard FileManager.default.fileExists(atPath: media.fileURL.path) else {
@@ -344,7 +609,7 @@ private enum CloudKitJournalRecordFactory {
 
                 let mediaID = mediaRecordID(block.id)
                 mediaRecordNames.append(mediaID.recordName)
-                records.append(
+                contentRecords.append(
                     mediaRecord(
                         for: media,
                         block: block,
@@ -358,23 +623,22 @@ private enum CloudKitJournalRecordFactory {
             }
         }
 
-        let manifestNames = CloudKitManifestRecordNames(
-                entryRecordNames: entryRecordNames,
-                blockRecordNames: blockRecordNames,
-                mediaRecordNames: mediaRecordNames
-            )
-            .merging(existingManifest.map(manifestRecordNames))
-        records.append(
-            manifestRecord(
-                generatedAt: snapshot.generatedAt,
-                entryRecordNames: manifestNames.entryRecordNames,
-                blockRecordNames: manifestNames.blockRecordNames,
-                mediaRecordNames: manifestNames.mediaRecordNames
-            )
+        let currentManifestNames = CloudKitManifestRecordNames(
+            entryRecordNames: entryRecordNames,
+            blockRecordNames: blockRecordNames,
+            mediaRecordNames: mediaRecordNames
+        )
+        let manifestNames = currentManifestNames
+            .merging(existingManifest.map(CloudKitManifestRecordNames.init(record:)))
+        let manifest = manifestRecord(
+            generatedAt: snapshot.generatedAt,
+            names: manifestNames
         )
 
         return CloudKitJournalRecordPayload(
-            records: records,
+            contentRecords: contentRecords,
+            manifestRecord: manifest,
+            currentManifestNames: currentManifestNames,
             mediaRecordCount: mediaRecordCount,
             skippedMediaCount: skippedMediaCount
         )
@@ -390,27 +654,12 @@ private enum CloudKitJournalRecordFactory {
             + entry.blocks.map { mediaRecordID($0.id) }
     }
 
-    private static func manifestRecordNames(_ record: CKRecord) -> CloudKitManifestRecordNames {
-        CloudKitManifestRecordNames(
-            entryRecordNames: record.stringArrayValue(Field.entryRecordNames),
-            blockRecordNames: record.stringArrayValue(Field.blockRecordNames),
-            mediaRecordNames: record.stringArrayValue(Field.mediaRecordNames)
-        )
-    }
-
-    private static func manifestRecord(
+    static func manifestRecord(
         generatedAt: Date,
-        entryRecordNames: [String],
-        blockRecordNames: [String],
-        mediaRecordNames: [String]
+        names: CloudKitManifestRecordNames
     ) -> CKRecord {
         let record = CKRecord(recordType: RecordType.manifest, recordID: manifestRecordID())
-        record[Field.schemaVersion] = NSNumber(value: 1)
-        record[Field.generatedAt] = generatedAt as NSDate
-        record[Field.entryRecordNames] = entryRecordNames as NSArray
-        record[Field.blockRecordNames] = blockRecordNames as NSArray
-        record[Field.mediaRecordNames] = mediaRecordNames as NSArray
-        return record
+        return names.applying(to: record, generatedAt: generatedAt)
     }
 
     private static func entryRecord(
@@ -488,7 +737,7 @@ private enum CloudKitJournalRecordFactory {
     }
 }
 
-private enum CloudKitJournalRecordDecoder {
+enum CloudKitJournalRecordDecoder {
     private struct DecodedBlock {
         var entryExternalID: String
         var block: JournalSyncBlock
@@ -502,18 +751,22 @@ private enum CloudKitJournalRecordDecoder {
     static func snapshot(
         entryRecords: [CKRecord],
         blockRecords: [CKRecord],
-        mediaRecords: [CKRecord]
+        mediaRecords: [CKRecord],
+        generatedAt: Date = Date()
     ) -> CloudKitJournalDownloadPayload {
         var skippedMediaCount = 0
-        let mediaByBlockID = Dictionary(
-            uniqueKeysWithValues: mediaRecords.compactMap { record -> (String, JournalSyncMediaAttachment)? in
-                guard let media = decodedMedia(from: record) else {
-                    skippedMediaCount += 1
-                    return nil
-                }
-                return (media.blockExternalID, media.attachment)
+        var mediaByBlockID: [String: JournalSyncMediaAttachment] = [:]
+        for record in mediaRecords {
+            guard let media = decodedMedia(from: record) else {
+                skippedMediaCount += 1
+                continue
             }
-        )
+            guard mediaByBlockID[media.blockExternalID] == nil else {
+                skippedMediaCount += 1
+                continue
+            }
+            mediaByBlockID[media.blockExternalID] = media.attachment
+        }
 
         let blocksByEntryID = Dictionary(
             grouping: blockRecords.compactMap { decodedBlock(from: $0, mediaByBlockID: mediaByBlockID) },
@@ -530,7 +783,7 @@ private enum CloudKitJournalRecordDecoder {
             lhs.dateModified > rhs.dateModified
         }
 
-        let snapshot = JournalSyncSnapshot(entries: entries)
+        let snapshot = JournalSyncSnapshot(generatedAt: generatedAt, entries: entries)
         return CloudKitJournalDownloadPayload(
             snapshot: snapshot,
             mediaAttachmentCount: snapshot.mediaAttachments.count,
@@ -629,9 +882,10 @@ private enum CloudKitJournalRecordDecoder {
 }
 
 private extension Array {
-    func chunked(into size: Int) -> [[Element]] {
-        stride(from: 0, to: count, by: size).map { start in
-            Array(self[start..<Swift.min(start + size, count)])
+    func batches(of size: Int) -> some Sequence<[Element]> {
+        let batchSize = Swift.max(1, size)
+        return stride(from: 0, to: count, by: batchSize).lazy.map { start in
+            Array(self[start..<Swift.min(start + batchSize, count)])
         }
     }
 }
