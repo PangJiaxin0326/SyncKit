@@ -6,6 +6,7 @@ public protocol JournalSyncProvider: Sendable {
 
     func accountStatus() async -> CloudAccountStatus
     func uploadJournal(_ snapshot: JournalSyncSnapshot) async throws -> SyncResult
+    func downloadJournal() async throws -> DownloadResult
 }
 
 public enum CloudAccountStatus: String, Codable, Hashable, Sendable, CaseIterable {
@@ -50,6 +51,34 @@ public struct SyncResult: Codable, Hashable, Sendable {
         self.entriesUploaded = entriesUploaded
         self.blocksUploaded = blocksUploaded
         self.mediaUploaded = mediaUploaded
+        self.mediaSkipped = mediaSkipped
+        self.completedAt = completedAt
+    }
+}
+
+public struct DownloadResult: Codable, Hashable, Sendable {
+    public var snapshot: JournalSyncSnapshot
+    public var recordsDownloaded: Int
+    public var entriesDownloaded: Int
+    public var blocksDownloaded: Int
+    public var mediaDownloaded: Int
+    public var mediaSkipped: Int
+    public var completedAt: Date
+
+    public init(
+        snapshot: JournalSyncSnapshot,
+        recordsDownloaded: Int,
+        entriesDownloaded: Int,
+        blocksDownloaded: Int,
+        mediaDownloaded: Int,
+        mediaSkipped: Int,
+        completedAt: Date = Date()
+    ) {
+        self.snapshot = snapshot
+        self.recordsDownloaded = recordsDownloaded
+        self.entriesDownloaded = entriesDownloaded
+        self.blocksDownloaded = blocksDownloaded
+        self.mediaDownloaded = mediaDownloaded
         self.mediaSkipped = mediaSkipped
         self.completedAt = completedAt
     }
