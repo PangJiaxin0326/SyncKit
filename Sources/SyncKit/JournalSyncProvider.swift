@@ -7,6 +7,16 @@ public protocol JournalSyncProvider: Sendable {
     func accountStatus() async -> CloudAccountStatus
     func uploadJournal(_ snapshot: JournalSyncSnapshot) async throws -> SyncResult
     func downloadJournal() async throws -> DownloadResult
+    /// Delete one entry (and its blocks/media) from the remote store. Default
+    /// implementation throws `SyncError.deletionUnsupported`; backends that
+    /// can targeted-delete a single record set override it.
+    func deleteEntry(_ entry: JournalSyncEntry) async throws
+}
+
+extension JournalSyncProvider {
+    public func deleteEntry(_ entry: JournalSyncEntry) async throws {
+        throw SyncError.deletionUnsupported(providerID: id)
+    }
 }
 
 public enum CloudAccountStatus: String, Codable, Hashable, Sendable, CaseIterable {
@@ -86,11 +96,14 @@ public struct DownloadResult: Codable, Hashable, Sendable {
 
 public enum SyncError: LocalizedError, Equatable, Sendable {
     case unavailableAccount(CloudAccountStatus)
+    case deletionUnsupported(providerID: String)
 
     public var errorDescription: String? {
         switch self {
         case .unavailableAccount(let status):
             "iCloud is \(status.displayName.lowercased())."
+        case .deletionUnsupported(let id):
+            "The \(id) sync provider does not support targeted entry deletion."
         }
     }
 }

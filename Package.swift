@@ -2,18 +2,36 @@
 
 import PackageDescription
 
+let swiftSettings: [SwiftSetting] = [
+    .enableUpcomingFeature("StrictConcurrency"),
+    .swiftLanguageMode(.v6),
+]
+
 let package = Package(
     name: "SyncKit",
     platforms: [
-        .iOS(.v17),
-        .macOS(.v14),
-        .visionOS(.v1),
+        .iOS("26.5"),
+        .macOS("26.5"),
+        .visionOS("26.5"),
     ],
     products: [
         .library(name: "SyncKit", targets: ["SyncKit"]),
     ],
+    dependencies: [
+        .package(url: "https://github.com/PangJiaxin0326/AIKit.git", branch: "main"),
+    ],
     targets: [
-        .target(name: "SyncKit"),
-        .testTarget(name: "SyncKitTests", dependencies: ["SyncKit"]),
+        .target(
+            name: "SyncKit",
+            dependencies: [
+                .product(name: "AIKitToolKit", package: "AIKit"),
+            ],
+            swiftSettings: swiftSettings
+        ),
+        .testTarget(
+            name: "SyncKitTests",
+            dependencies: ["SyncKit"],
+            swiftSettings: swiftSettings
+        ),
     ]
 )

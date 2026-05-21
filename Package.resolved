@@ -1,0 +1,15 @@
+{
+  "originHash" : "c050e5b3b6b67ba57d42f5fd7a5456953126c18d51c804b0ad632e474623d193",
+  "pins" : [
+    {
+      "identity" : "multimodalkit",
+      "kind" : "remoteSourceControl",
+      "location" : "https://github.com/PangJiaxin0326/MultiModalKit.git",
+      "state" : {
+        "branch" : "main",
+        "revision" : "9e4830130896731c211f660eca76c2922c1b2a85"
+      }
+    }
+  ],
+  "version" : 3
+}
