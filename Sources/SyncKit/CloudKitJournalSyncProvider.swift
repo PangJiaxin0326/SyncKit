@@ -71,9 +71,10 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
             throw SyncError.unavailableAccount(status)
         }
 
-        let entryRecords = try await fetchRecords(recordType: RecordType.entry)
-        let blockRecords = try await fetchRecords(recordType: RecordType.block)
-        let mediaRecords = try await fetchRecords(recordType: RecordType.media)
+        let records = try await fetchChangedRecords()
+        let entryRecords = records.filter { $0.recordType == RecordType.entry }
+        let blockRecords = records.filter { $0.recordType == RecordType.block }
+        let mediaRecords = records.filter { $0.recordType == RecordType.media }
         let payload = CloudKitJournalRecordDecoder.snapshot(
             entryRecords: entryRecords,
             blockRecords: blockRecords,
@@ -98,72 +99,32 @@ public final class CloudKitJournalSyncProvider: JournalSyncProvider {
         }
     }
 
-    private func fetchRecords(recordType: String) async throws -> [CKRecord] {
+    private func fetchChangedRecords() async throws -> [CKRecord] {
+        let zoneID = CKRecordZone.default().zoneID
         var records: [CKRecord] = []
-        var cursor: CKQueryOperation.Cursor?
+        var changeToken: CKServerChangeToken?
+        var moreComing = false
 
-        do {
-            repeat {
-                let page = try await fetchRecordPage(recordType: recordType, cursor: cursor)
-                records.append(contentsOf: page.records)
-                cursor = page.cursor
-            } while cursor != nil
-        } catch where error.isMissingCloudKitRecordType {
-            return []
-        }
+        repeat {
+            let result = try await database.recordZoneChanges(
+                inZoneWith: zoneID,
+                since: changeToken,
+                desiredKeys: nil,
+                resultsLimit: nil
+            )
+            for recordResult in result.modificationResultsByID.values {
+                switch recordResult {
+                case .success(let modification):
+                    records.append(modification.record)
+                case .failure(let error):
+                    throw error
+                }
+            }
+            changeToken = result.changeToken
+            moreComing = result.moreComing
+        } while moreComing
 
         return records
-    }
-
-    private func fetchRecordPage(
-        recordType: String,
-        cursor: CKQueryOperation.Cursor?
-    ) async throws -> CloudKitQueryPage {
-        try await withCheckedThrowingContinuation { continuation in
-            let operation = if let cursor {
-                CKQueryOperation(cursor: cursor)
-            } else {
-                CKQueryOperation(
-                    query: CKQuery(
-                        recordType: recordType,
-                        predicate: NSPredicate(value: true)
-                    )
-                )
-            }
-
-            let records = LockedCloudKitRecords()
-            let errors = LockedCloudKitErrors()
-            operation.resultsLimit = CKQueryOperation.maximumResults
-            operation.qualityOfService = .userInitiated
-            operation.recordMatchedBlock = { _, result in
-                switch result {
-                case .success(let record):
-                    records.append(record)
-                case .failure(let error):
-                    errors.append(error)
-                }
-            }
-            operation.queryResultBlock = { result in
-                if let recordError = errors.first {
-                    continuation.resume(throwing: recordError)
-                    return
-                }
-
-                switch result {
-                case .success(let cursor):
-                    continuation.resume(
-                        returning: CloudKitQueryPage(
-                            records: records.values,
-                            cursor: cursor
-                        )
-                    )
-                case .failure(let error):
-                    continuation.resume(throwing: error)
-                }
-            }
-
-            database.add(operation)
-        }
     }
 }
 
@@ -196,11 +157,6 @@ private struct CloudKitJournalDownloadPayload {
     var snapshot: JournalSyncSnapshot
     var mediaAttachmentCount: Int
     var skippedMediaCount: Int
-}
-
-private struct CloudKitQueryPage {
-    var records: [CKRecord]
-    var cursor: CKQueryOperation.Cursor?
 }
 
 private enum RecordType {
@@ -490,36 +446,6 @@ private enum CloudKitJournalRecordDecoder {
     }
 }
 
-private final class LockedCloudKitRecords: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [CKRecord] = []
-
-    var values: [CKRecord] {
-        lock.withLock { storage }
-    }
-
-    func append(_ record: CKRecord) {
-        lock.withLock {
-            storage.append(record)
-        }
-    }
-}
-
-private final class LockedCloudKitErrors: @unchecked Sendable {
-    private let lock = NSLock()
-    private var storage: [Error] = []
-
-    var first: Error? {
-        lock.withLock { storage.first }
-    }
-
-    func append(_ error: Error) {
-        lock.withLock {
-            storage.append(error)
-        }
-    }
-}
-
 private extension Array {
     func chunked(into size: Int) -> [[Element]] {
         stride(from: 0, to: count, by: size).map { start in
@@ -571,24 +497,5 @@ private extension CKRecord {
         default:
             nil
         }
-    }
-}
-
-private extension NSLock {
-    func withLock<T>(_ body: () throws -> T) rethrows -> T {
-        lock()
-        defer { unlock() }
-        return try body()
-    }
-}
-
-private extension Error {
-    var isMissingCloudKitRecordType: Bool {
-        guard let error = self as? CKError else { return false }
-        if error.code == .unknownItem {
-            return true
-        }
-
-        return error.localizedDescription.localizedCaseInsensitiveContains("record type")
     }
 }
