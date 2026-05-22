@@ -1,5 +1,5 @@
 import Foundation
-import AIKitToolKit
+import AIToolKit
 
 /// Tool errors thrown by the sync tools. Marked retriable by default so the
 /// orchestrator can surface the message to the model on the next iteration.

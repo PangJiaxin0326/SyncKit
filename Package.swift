@@ -18,13 +18,13 @@ let package = Package(
         .library(name: "SyncKit", targets: ["SyncKit"]),
     ],
     dependencies: [
-        .package(url: "https://github.com/PangJiaxin0326/AIKit.git", branch: "main"),
+        .package(url: "https://github.com/PangJiaxin0326/AIToolKit.git", branch: "main"),
     ],
     targets: [
         .target(
             name: "SyncKit",
             dependencies: [
-                .product(name: "AIKitToolKit", package: "AIKit"),
+                .product(name: "AIToolKit", package: "AIToolKit"),
             ],
             swiftSettings: swiftSettings
         ),

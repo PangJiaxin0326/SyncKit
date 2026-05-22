@@ -1,13 +1,13 @@
 {
-  "originHash" : "c050e5b3b6b67ba57d42f5fd7a5456953126c18d51c804b0ad632e474623d193",
+  "originHash" : "a939e2df648873754a5eb22cab2a059d14e73c368bacb94f8e7cbab9c32e7640",
   "pins" : [
     {
-      "identity" : "multimodalkit",
+      "identity" : "aitoolkit",
       "kind" : "remoteSourceControl",
-      "location" : "https://github.com/PangJiaxin0326/MultiModalKit.git",
+      "location" : "https://github.com/PangJiaxin0326/AIToolKit.git",
       "state" : {
         "branch" : "main",
-        "revision" : "9e4830130896731c211f660eca76c2922c1b2a85"
+        "revision" : "2939b5e8fb2c76c2a78b4f862a7336e52cc0fa23"
       }
     }
   ],
