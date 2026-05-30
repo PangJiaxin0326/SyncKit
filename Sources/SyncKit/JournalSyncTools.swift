@@ -33,7 +33,7 @@ public struct CheckSyncAccountStatusTool: Tool {
     on this device. Use before calling uploadJournalSnapshot or \
     downloadJournalSnapshot to fail fast with a clear message.
     """
-    public static let schema = ToolSchema.object(properties: [:])
+    public static let inputSchema = ToolSchema.object(properties: [:])
 
     private let provider: any JournalSyncProvider
 
@@ -41,7 +41,7 @@ public struct CheckSyncAccountStatusTool: Tool {
         self.provider = provider
     }
 
-    public func invoke(_ input: Input, in context: ToolContext) async throws -> Output {
+    public func call(_ input: Input, in context: ToolContext) async throws -> Output {
         let status = await provider.accountStatus()
         return Output(
             providerID: provider.id,
@@ -74,7 +74,7 @@ public struct UploadJournalSnapshotTool: Tool {
     the snapshot — this tool takes no arguments. Reports counts of records \
     uploaded.
     """
-    public static let schema = ToolSchema.object(properties: [:])
+    public static let inputSchema = ToolSchema.object(properties: [:])
 
     private let provider: any JournalSyncProvider
     private let host: any JournalSyncHost
@@ -84,7 +84,7 @@ public struct UploadJournalSnapshotTool: Tool {
         self.host = host
     }
 
-    public func invoke(_ input: Input, in context: ToolContext) async throws -> Output {
+    public func call(_ input: Input, in context: ToolContext) async throws -> Output {
         let snapshot: JournalSyncSnapshot
         do {
             snapshot = try await host.makeSnapshot()
@@ -140,7 +140,7 @@ public struct DownloadJournalSnapshotTool: Tool {
     after a fresh install. Reports counts downloaded and how many entries the \
     host merged.
     """
-    public static let schema = ToolSchema.object(properties: [:])
+    public static let inputSchema = ToolSchema.object(properties: [:])
 
     private let provider: any JournalSyncProvider
     private let host: any JournalSyncHost
@@ -150,7 +150,7 @@ public struct DownloadJournalSnapshotTool: Tool {
         self.host = host
     }
 
-    public func invoke(_ input: Input, in context: ToolContext) async throws -> Output {
+    public func call(_ input: Input, in context: ToolContext) async throws -> Output {
         let download: DownloadResult
         do {
             download = try await provider.downloadJournal()
@@ -204,7 +204,7 @@ public struct DeleteRemoteJournalEntryTool: Tool {
     asks for an all-devices delete (e.g. "delete for all"); a local-only delete \
     is a different tool.
     """
-    public static let schema = ToolSchema.object(
+    public static let inputSchema = ToolSchema.object(
         properties: [
             "entryID": .string(description: "The entry's UUID."),
         ],
@@ -219,7 +219,7 @@ public struct DeleteRemoteJournalEntryTool: Tool {
         self.host = host
     }
 
-    public func invoke(_ input: Input, in context: ToolContext) async throws -> Output {
+    public func call(_ input: Input, in context: ToolContext) async throws -> Output {
         let syncEntry: JournalSyncEntry?
         do {
             syncEntry = try await host.syncEntry(forID: input.entryID)
